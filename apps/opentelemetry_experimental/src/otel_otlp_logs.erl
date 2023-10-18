@@ -31,36 +31,38 @@
 -define(IS_STRING(String),
         (is_list(String) orelse is_binary(String))).
 
-to_proto(Logs, Resource, Config) ->
-    InstrumentationScopeLogs = to_proto_by_instrumentation_scope(Logs, Config),
-    Attributes = otel_resource:attributes(Resource),
-    ResourceLogs = #{resource => #{attributes => otel_otlp_common:to_attributes(Attributes),
-                                   dropped_attributes_count => otel_attributes:dropped(Attributes)},
-                     scope_logs => InstrumentationScopeLogs},
-    case otel_resource:schema_url(Resource) of
-        undefined ->
-            #{resource_logs => [ResourceLogs]};
-        SchemaUrl ->
-            #{resource_logs => [ResourceLogs#{schema_url => SchemaUrl}]}
+-spec to_proto(ets:table(), otel_resource:t(), logger:handler_config()) ->
+          opentelemetry_exporter_logs_service_pb:export_logs_service_request() | empty.
+to_proto(Tab, Resource, LogHandlerConfig) ->
+    case to_proto_by_instrumentation_scope(Tab, LogHandlerConfig) of
+        [] ->
+            empty;
+        InstrumentationScopeLogs ->
+            Attributes = otel_resource:attributes(Resource),
+            ResourceLogs = #{resource => #{attributes => otel_otlp_common:to_attributes(Attributes),
+                                           dropped_attributes_count => otel_attributes:dropped(Attributes)},
+                             scope_logs => InstrumentationScopeLogs},
+            case otel_resource:schema_url(Resource) of
+                undefined ->
+                    #{resource_logs => [ResourceLogs]};
+                SchemaUrl ->
+                    #{resource_logs => [ResourceLogs#{schema_url => SchemaUrl}]}
+            end
     end.
 
+to_proto_by_instrumentation_scope(Tab, LogHandlerConfig) ->
+    Key = ets:first(Tab),
+    to_proto_by_instrumentation_scope(Tab, Key, LogHandlerConfig).
 
-to_proto_by_instrumentation_scope(Logs, Config) ->
-    ScopeLogs = logs_by_scope(Logs, Config),
-    maps:fold(fun(Scope, LogRecords, Acc) ->
-                      [#{scope => otel_otlp_common:to_instrumentation_scope_proto(Scope),
-                         log_records => LogRecords
-                         %% schema_url              => unicode:chardata() % = 3, optional
-                        } | Acc]
-              end, [], ScopeLogs).
-
-
-logs_by_scope(ScopeLogs, Config) ->
-    maps:fold(fun(InstrumentationScope, Logs, Acc) ->
-                      LogRecords = [log_record(Log, Config) || Log <- Logs],
-                      Acc#{InstrumentationScope => LogRecords}
-              end, #{}, ScopeLogs).
-
+to_proto_by_instrumentation_scope(_Tab, '$end_of_table', _LogHandlerConfig) ->
+    [];
+to_proto_by_instrumentation_scope(Tab, InstrumentationScope, LogHandlerConfig) ->
+    InstrumentationScopeLogs = lists:foldl(fun({_Scope, LogEvent}, Acc) ->
+                                                   [log_record(LogEvent, LogHandlerConfig) | Acc]
+                                           end, [], ets:lookup(Tab, InstrumentationScope)),
+    InstrumentationScopeSpansProto = otel_otlp_common:to_instrumentation_scope_proto(InstrumentationScope),
+    [InstrumentationScopeSpansProto#{log_records => InstrumentationScopeLogs}
+    | to_proto_by_instrumentation_scope(Tab, ets:next(Tab, InstrumentationScope), LogHandlerConfig)].
 
 log_record(#{level := Level,
              msg := Body,
@@ -112,6 +114,7 @@ from_hex_str(Str, Size) ->
 
 format_msg({string, Chardata}, Meta, Config) ->
     format_msg({"~ts", [Chardata]}, Meta, Config);
+%% TODO: check it report_cb is formatter config
 format_msg({report,_}=Msg, Meta, #{report_cb := Fun}=Config)
   when is_function(Fun,1); is_function(Fun,2) ->
     format_msg(Msg, Meta#{report_cb => Fun}, maps:remove(report_cb,Config));

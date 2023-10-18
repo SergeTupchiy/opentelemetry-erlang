@@ -12,7 +12,8 @@
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
 %%
-%% @doc
+%% @doc Specification:
+%% https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/logs/sdk.md
 %% @end
 %%%-------------------------------------------------------------------------
 -module(otel_log_handler).
@@ -28,98 +29,144 @@
          adding_handler/1,
          removing_handler/1,
          changing_config/3,
-         filter_config/1,
          report_cb/1]).
 
 -export([init/1,
          callback_mode/0,
          idle/3,
          exporting/3,
-         handle_event/3]).
+         terminate/3]).
 
 -type config() :: #{id => logger:handler_id(),
-                    regname := atom(),
-                    config => term(),
+                    reg_name := atom(),
+                    config => otel_log_handler_config(),
                     level => logger:level() | all | none,
                     module => module(),
                     filter_default => log | stop,
                     filters => [{logger:filter_id(), logger:filter()}],
                     formatter => {module(), logger:formatter_config()}}.
 
--define(DEFAULT_CALL_TIMEOUT, 5000).
--define(DEFAULT_MAX_QUEUE_SIZE, 2048).
--define(DEFAULT_SCHEDULED_DELAY_MS, timer:seconds(5)).
--define(DEFAULT_EXPORTER_TIMEOUT_MS, timer:minutes(5)).
+-type otel_log_handler_config() ::
+        #{max_queue_size => max_queue_size(),
+          max_export_batch_size => max_export_batch_size(),
+          exporting_timeout_ms => exporting_timeout_ms(),
+          scheduled_delay_ms => scheduled_delay_ms(),
+          check_table_size_ms => check_table_size_ms(),
+          exporter => exporter_config()}.
+
+-type max_queue_size() :: non_neg_integer() | infinity.
+-type exporter_config() :: module() | {module(), Config :: term()} | undefined.
+-type max_export_batch_size() :: non_neg_integer().
+-type exporting_timeout_ms() :: non_neg_integer().
+-type scheduled_delay_ms() :: non_neg_integer().
+-type check_table_size_ms() :: non_neg_integer().
+
+-record(data, {exporter              :: {module(), State :: term()} | undefined,
+               exporter_config       :: exporter_config(),
+               resource              :: otel_resource:t(),
+               handed_off_table      :: atom() | undefined,
+               runner_pid            :: pid() | undefined,
+               max_queue_size        :: max_queue_size(),
+               max_export_batch_size :: max_export_batch_size(),
+               exporting_timeout_ms  :: exporting_timeout_ms(),
+               scheduled_delay_ms    :: scheduled_delay_ms(),
+               check_table_size_ms   :: check_table_size_ms(),
+               table_1               :: atom(),
+               table_2               :: atom(),
+               reg_name              :: atom(),
+               config                :: config()
+              }).
+
+-define(SUP, opentelemetry_experimental_sup).
 
 -define(name_to_reg_name(Module, Id),
         list_to_atom(lists:concat([Module, "_", Id]))).
+-define(CURRENT_TABLES_KEY(Name), {?MODULE, current_table, Name}).
+-define(TABLE_NAME(RegName, TabName), list_to_atom(lists:concat([RegName, "_", TabName]))).
+-define(TABLE_1(RegName), ?TABLE_NAME(RegName, table1)).
+-define(TABLE_2(RegName), ?TABLE_NAME(RegName, table2)).
+-define(CURRENT_TABLE(RegName), persistent_term:get(?CURRENT_TABLES_KEY(RegName))).
+-define(IS_ENABLED(RegName), {?MODULE, enabled, RegName}).
 
--record(data, {exporter             :: {module(), term()} | undefined,
-               exporter_config      :: {module(), term()} | undefined,
-               resource             :: otel_resource:t(),
+-define(DEFAULT_MAX_QUEUE_SIZE, 2048).
+-define(DEFAULT_MAX_EXPORT_BATCH_SIZE, 512).
+-define(DEFAULT_SCHEDULED_DELAY_MS, timer:seconds(1)).
+-define(DEFAULT_EXPORTER_TIMEOUT_MS, timer:seconds(30)).
+-define(DEFAULT_CHECK_TABLE_SIZE_MS, 200).
+-define(DEFAULT_EXPORTER,
+        {opentelemetry_exporter, #{protocol => grpc, endpoints => ["http://172.18.0.2:4317"]}}).
 
-               runner_pid           :: pid() | undefined,
-               max_queue_size       :: integer() | infinity,
-               exporting_timeout_ms :: integer(),
-               scheduled_delay_ms   :: integer(),
+-define(SUP_SHUTDOWN_MS, 5000).
+%% Sligthly lower than SUP_SHUTDOWN_MS
+-define(GRACE_SHUTDOWN_MS, 4500).
+-define(time_ms, erlang:monotonic_time(millisecond)).
+-define(rem_time(_Timeout_, _T0_, _T1_), max(0, _Timeout_ - (_T1_ - _T0_))).
 
-               config :: #{},
-               batch  :: #{opentelemetry:instrumentation_scope() => [logger:log_event()]}}).
+-define(check_tab_timeout(_TimeoutMs_), {{timeout, check_table_size}, _TimeoutMs_, check_table_size}).
 
 start_link(RegName, Config) ->
     gen_statem:start_link({local, RegName}, ?MODULE, [RegName, Config], []).
 
+%% TODO:
+%% - implment force flush
+%%   https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/logs/sdk.md#forceflush-1
+%% - implement max_batch_size fully
+
+%%--------------------------------------------------------------------
+%% Logger handler callbacks
+%%--------------------------------------------------------------------
+
 -spec adding_handler(Config) -> {ok, Config} | {error, Reason} when
       Config :: config(),
       Reason :: term().
-adding_handler(#{id := Id,
-                 module := Module}=Config) ->
-    RegName = ?name_to_reg_name(Module, Id),
-    ChildSpec =
-        #{id       => Id,
-          start    => {?MODULE, start_link, [RegName, Config]},
-          restart  => temporary,
-          shutdown => 2000,
-          type     => worker,
-          modules  => [?MODULE]},
-    case supervisor:start_child(opentelemetry_experimental_sup, ChildSpec) of
-        {ok, _Pid} ->
-            %% ok = logger_handler_watcher:register_handler(Name,Pid),
-            %% OlpOpts = logger_olp:get_opts(Olp),
-            {ok, Config#{regname => RegName}};
-        {error, {Reason, Ch}} when is_tuple(Ch), element(1, Ch) == child ->
-            {error, Reason};
-        {error, _Reason}=Error ->
-            Error
+adding_handler(#{id := Id}=Config) ->
+    RegName = ?name_to_reg_name(?MODULE, Id),
+    OtelConfig = maps:get(config, Config, #{}),
+    case validate_config(OtelConfig) of
+        ok ->
+            OtelConfig1 = maps:merge(default_config(), OtelConfig),
+            start(Id, RegName, Config#{config => OtelConfig1});
+        Err ->
+            Err
     end.
 
-%%%-----------------------------------------------------------------
-%%% Updating handler config
 -spec changing_config(SetOrUpdate, OldConfig, NewConfig) ->
-          {ok,Config} | {error,Reason} when
+          {ok, Config} | {error, Reason} when
       SetOrUpdate :: set | update,
       OldConfig :: config(),
       NewConfig :: config(),
       Config :: config(),
       Reason :: term().
-changing_config(SetOrUpdate, OldConfig, NewConfig=#{regname := Id}) ->
-    %% eqwalizer:ignore doesn't like gen_`statem:call' returns `term()'
-    gen_statem:call(Id, {changing_config, SetOrUpdate, OldConfig, NewConfig}).
+changing_config(_, #{reg_name := RegName}, #{reg_name := RegName1}) when RegName =/= RegName1 ->
+    {error, reg_name_change_not_allowed};
+changing_config(_, #{config := #{exporter := Exporter}},
+                #{config := #{exporter := Exporter1}}) when Exporter =/= Exporter1 ->
+    {error, exporter_change_not_allowed};
+changing_config(SetOrUpdate, #{reg_name := RegName, config := OldOtelConfig}, NewConfig) ->
+    NewOtelConfig = maps:get(config, NewConfig, #{}),
+    case validate_config(NewOtelConfig) of
+        ok ->
+            NewOtelConfig1 = case SetOrUpdate of
+                                 update -> maps:merge(OldOtelConfig, NewOtelConfig);
+                                 set -> maps:merge(default_config(), NewOtelConfig)
+                             end,
+            NewConfig1 = NewConfig#{config => NewOtelConfig1, reg_name => RegName},
+            gen_statem:call(RegName, {changing_config, NewConfig1});
+        Err ->
+            Err
+    end.
 
-%%%-----------------------------------------------------------------
-%%% Handler being removed
--spec removing_handler(Config) -> ok when
-      Config :: config().
-removing_handler(Config=#{regname := Id}) ->
-    %% eqwalizer:ignore doesn't like gen_`statem:call' returns `term()'
-    gen_statem:call(Id, {removing_handler, Config}).
+-spec removing_handler(Config) -> ok | {error, Reason} when
+      Config :: config(), Reason :: term().
+removing_handler(_Config=#{id := Id}) ->
+    Res = supervisor:terminate_child(?SUP, Id),
+    _ = supervisor:delete_child(?SUP, Id),
+    Res.
 
-%%%-----------------------------------------------------------------
-%%% Log a string or report
--spec log(LogEvent, Config) -> ok when
+-spec log(LogEvent, Config) -> true | dropped | {error, term()} when
       LogEvent :: logger:log_event(),
       Config :: config().
-log(LogEvent, _Config=#{regname := Id}) ->
+log(LogEvent, _Config=#{reg_name := RegName}) ->
     Scope = case LogEvent of
                 #{meta := #{otel_scope := Scope0=#instrumentation_scope{}}} ->
                     Scope0;
@@ -128,111 +175,242 @@ log(LogEvent, _Config=#{regname := Id}) ->
                 _ ->
                     opentelemetry:instrumentation_scope(<<>>, <<>>, <<>>)
             end,
+    do_insert(RegName, Scope, LogEvent).
 
-    gen_statem:cast(Id, {log, Scope, LogEvent}).
+%%--------------------------------------------------------------------
+%% gen_statem callbacks
+%%--------------------------------------------------------------------
 
-%%%-----------------------------------------------------------------
-%%% Remove internal fields from configuration
--spec filter_config(Config) -> Config when
-      Config :: config().
-filter_config(Config=#{regname := Id}) ->
-    %% eqwalizer:ignore doesn't like gen_`statem:call' returns `term()'
-    gen_statem:call(Id, {filter_config, Config}).
-
-init([_RegName, Config]) ->
+init([RegName, #{config := OtelConfig} = Config]) ->
     process_flag(trap_exit, true),
-
     Resource = otel_resource_detector:get_resource(),
+    ExporterConfig = maps:get(exporter, OtelConfig, ?DEFAULT_EXPORTER),
+    Tab1 = ?TABLE_1(RegName),
+    Tab2 = ?TABLE_2(RegName),
+    _Tid1 = new_export_table(Tab1),
+    _Tid2 = new_export_table(Tab2),
+    persistent_term:put(?CURRENT_TABLES_KEY(RegName), Tab1),
 
-    SizeLimit = maps:get(max_queue_size, Config, ?DEFAULT_MAX_QUEUE_SIZE),
-    ExportingTimeout = maps:get(exporting_timeout_ms, Config, ?DEFAULT_EXPORTER_TIMEOUT_MS),
-    ScheduledDelay = maps:get(scheduled_delay_ms, Config, ?DEFAULT_SCHEDULED_DELAY_MS),
+    Data = #data{exporter=undefined,
+                 exporter_config=ExporterConfig,
+                 resource=Resource,
+                 table_1=Tab1,
+                 table_2=Tab2,
+                 reg_name=RegName},
+    Data1 = add_config_to_data(Config, Data),
 
-    ExporterConfig = maps:get(exporter, Config, {opentelemetry_exporter, #{protocol => grpc}}),
-
-    {ok, idle, #data{exporter=undefined,
-                     exporter_config=ExporterConfig,
-                     resource=Resource,
-                     config=Config,
-                     max_queue_size=case SizeLimit of
-                                        infinity -> infinity;
-                                        _ -> SizeLimit div erlang:system_info(wordsize)
-                                    end,
-                     exporting_timeout_ms=ExportingTimeout,
-                     scheduled_delay_ms=ScheduledDelay,
-                     batch=#{}}}.
+    %% TODO: it's enabled to start log events writes to ETS table,
+    %% but soon the handler can fail to init exporter
+    %% Disabling it if exporter config is none/undefined is not perfect either,
+    %% since the exporter may default to localhost:<default port>.
+    %% It may be better to init exporter here in init/1 cb and make choice to enable/disable
+    _ = enable(RegName),
+    {ok, idle, Data1, [?check_tab_timeout(Data1#data.check_table_size_ms)]}.
 
 callback_mode() ->
     [state_functions, state_enter].
 
 idle(enter, _OldState, Data=#data{exporter=undefined,
                                   exporter_config=ExporterConfig,
-                                  scheduled_delay_ms=SendInterval}) ->
-    Exporter = init_exporter(ExporterConfig),
+                                  scheduled_delay_ms=SendInterval,
+                                  reg_name=RegName}) ->
+    Exporter = init_exporter(RegName, ExporterConfig),
     {keep_state, Data#data{exporter=Exporter},
      [{{timeout, export_logs}, SendInterval, export_logs}]};
 idle(enter, _OldState, #data{scheduled_delay_ms=SendInterval}) ->
-    {keep_state_and_data, [{{timeout, export_logs}, SendInterval, export_logs}]};
+    {keep_state_and_data,
+     [{{timeout, export_logs}, SendInterval, export_logs}]};
 idle(_, export_logs, Data=#data{exporter=undefined,
-                                 exporter_config=ExporterConfig}) ->
-    Exporter = init_exporter(ExporterConfig),
-    {next_state, exporting, Data#data{exporter=Exporter}, [{next_event, internal, export}]};
+                                exporter_config=ExporterConfig,
+                                reg_name=RegName}) ->
+    Exporter = init_exporter(RegName, ExporterConfig),
+    {next_state, exporting, Data#data{exporter=Exporter}};
 idle(_, export_logs, Data) ->
-    {next_state, exporting, Data, [{next_event, internal, export}]};
+    {next_state, exporting, Data};
 idle(EventType, EventContent, Data) ->
-    handle_event(EventType, EventContent, Data).
+    handle_event_(idle, EventType, EventContent, Data).
 
 exporting({timeout, export_logs}, export_logs, _) ->
     {keep_state_and_data, [postpone]};
-exporting(enter, _OldState, _Data) ->
-    keep_state_and_data;
-exporting(internal, export, Data=#data{exporter=Exporter,
-                                       resource=Resource,
-                                       config=Config,
-                                       batch=Batch}) ->
-    map_size(Batch) =:= 0 orelse export(Exporter, Resource, Batch, Config),
-    {next_state, idle, Data#data{batch=#{}}};
-exporting(EventType, EventContent, Data) ->
-    handle_event(EventType, EventContent, Data).
+exporting(enter, _OldState, #data{exporter=undefined,
+                                  reg_name=RegName}) ->
+    %% exporter still undefined, go back to idle
+    %% first empty the table and disable the processor so no more log events are added
+    %% we wait until the attempt to export to disable so we don't lose log events
+    %% on startup but disable once it is clear an exporter isn't being set
+    clear_table_and_disable(RegName),
 
-handle_event({call, From}, {changing_config, _SetOrUpdate, _OldConfig, NewConfig}, Data) ->
-    {keep_state, Data#data{config=NewConfig}, [{reply, From, NewConfig}]};
-handle_event({call, From}, {removing_handler, Config}, _Data) ->
-    %% TODO: flush
-    {keep_state_and_data, [{reply, From, Config}]};
-handle_event({call, From}, {filter_handler, Config}, Data) ->
-    {keep_state, Data, [{reply, From, Config}]};
-handle_event({call, From}, {filter_config, Config}, Data) ->
-    {keep_state, Data, [{reply, From, Config}]};
-handle_event({call, _From}, _Msg, _Data) ->
-    keep_state_and_data;
-handle_event(cast, {log, Scope, LogEvent}, Data=#data{batch=Logs}) ->
-    {keep_state, Data#data{batch=maps:update_with(Scope, fun(V) ->
-                                                                  [LogEvent | V]
-                                                          end, [LogEvent], Logs)}};
-handle_event(_, _, _) ->
+    %% use state timeout to transition to `idle' since we can't set a
+    %% new state in an `enter' handler
+    {keep_state_and_data, [{state_timeout, 0, no_exporter}]};
+exporting(enter, _OldState, Data=#data{reg_name=RegName,
+                                       exporting_timeout_ms=ExportingTimeout,
+                                       scheduled_delay_ms=SendInterval}) ->
+    CurrentTab = ?CURRENT_TABLE(RegName),
+    case ets:info(CurrentTab, size) of
+        0 ->
+            %% in an `enter' handler we can't return a `next_state' or `next_event'
+            %% so we rely on a timeout to trigger the transition to `idle'
+            {keep_state, Data#data{runner_pid=undefined}, [{state_timeout, 0, empty_table}]};
+        _ ->
+            RunnerPid = export_logs(CurrentTab, Data),
+            {keep_state,
+             Data#data{runner_pid=RunnerPid, handed_off_table=CurrentTab},
+             [{state_timeout, ExportingTimeout, exporting_timeout},
+              {{timeout, export_logs}, SendInterval, export_logs}]}
+    end;
+
+%% TODO: we need to just check if `exporter=undefined' right?
+%% two hacks since we can't transition to a new state or send an action from `enter'
+exporting(state_timeout, no_exporter, Data) ->
+    {next_state, idle, Data};
+exporting(state_timeout, empty_table, Data) ->
+    {next_state, idle, Data};
+
+exporting(state_timeout, exporting_timeout, Data=#data{handed_off_table=ExportingTable}) ->
+    %% kill current exporting process because it is taking too long
+    %% which deletes the exporting table, so create a new one and
+    %% repeat the state to force another span exporting immediately
+    Data1 = kill_runner(Data),
+    new_export_table(ExportingTable),
+    {next_state, idle, Data1};
+%% important to verify runner_pid and FromPid are the same in case it was sent
+%% after kill_runner was called but before it had done the unlink
+exporting(info, {'EXIT', FromPid, _}, Data=#data{runner_pid=FromPid}) ->
+    complete_exporting(Data);
+%% important to verify runner_pid and FromPid are the same in case it was sent
+%% after kill_runner was called but before it had done the unlink
+exporting(info, {completed, FromPid}, Data=#data{runner_pid=FromPid}) ->
+    complete_exporting(Data);
+exporting(EventType, Event, Data) ->
+    handle_event_(exporting, EventType, Event, Data).
+
+terminate(_Reason, State, Data=#data{exporter=Exporter,
+                                     resource=Resource,
+                                     reg_name=RegName,
+                                     config=Config}) ->
+    _ = disable(RegName),
+    RunnerPid = erlang:spawn_link(fun() -> export(Exporter, Resource, ?CURRENT_TABLE(RegName), Config) end),
+    T0 = ?time_ms,
+    receive
+        {'EXIT', RunnerPid, _} ->
+            T1 = ?time_ms,
+            maybe_wait_for_prev_runner(State, Data, ?rem_time(?GRACE_SHUTDOWN_MS, T0, T1))
+    after ?GRACE_SHUTDOWN_MS -> ok
+    end,
+    ok.
+
+%%--------------------------------------------------------------------
+%% Internal functions
+%%--------------------------------------------------------------------
+
+start(Id, RegName, Config) ->
+    ChildSpec =
+        #{id       => Id,
+          start    => {?MODULE, start_link, [RegName, Config]},
+          restart  => transient,
+          shutdown => ?SUP_SHUTDOWN_MS,
+          type     => worker,
+          modules  => [?MODULE]},
+    case supervisor:start_child(?SUP, ChildSpec) of
+        {ok, _Pid} ->
+            %% ok = logger_handler_watcher:register_handler(Name,Pid),
+            %% OlpOpts = logger_olp:get_opts(Olp),
+            {ok, Config#{reg_name => RegName}};
+        {error, {Reason, Ch}} when is_tuple(Ch), element(1, Ch) == child ->
+            {error, Reason};
+        {error, _Reason}=Error ->
+            Error
+    end.
+
+handle_event_(State, {timeout, check_table_size}, check_table_size,
+              Data=#data{max_queue_size=MaxQueueSize,
+                         max_export_batch_size=MaxBatchSize,
+                         check_table_size_ms=CheckInterval,
+                         reg_name=RegName}) ->
+    Size = ets:info(?CURRENT_TABLE(RegName), size),
+    case Size >= MaxQueueSize of
+        true -> disable(RegName);
+        false -> enable(RegName)
+    end,
+    case Size >= MaxBatchSize of
+        true when State =:= exporting ->
+            {keep_state_and_data, [postpone]};
+        true ->
+            %% By no means it can ensure that max_export_batch_size is never exceeded.
+            %% However, it should work fine to trigger export as soon as the table
+            %% reaches the max size instead of waiting for the scheduled export timeout,
+            %% that can be a quite large value.
+            {next_state, exporting, Data, [?check_tab_timeout(CheckInterval)]};
+        false ->
+            {keep_state_and_data, [?check_tab_timeout(CheckInterval)]}
+    end;
+handle_event_(_State, internal, init_exporter, Data=#data{exporter=undefined,
+                                                     exporter_config=ExporterConfig,
+                                                     reg_name=RegName}) ->
+    Exporter = init_exporter(RegName, ExporterConfig),
+    {keep_state, Data#data{exporter=Exporter}};
+
+handle_event_(_State, {call, From}, {changing_config, NewConfig}, Data) ->
+    {keep_state, add_config_to_data(NewConfig, Data), [{reply, From, {ok, NewConfig}}]};
+handle_event_(_State, _, _, _) ->
     keep_state_and_data.
 
-%%
-
-init_exporter(ExporterConfig) ->
+init_exporter(RegName, ExporterConfig) ->
     case otel_exporter:init(ExporterConfig) of
         Exporter when Exporter =/= undefined andalso Exporter =/= none ->
+            enable(RegName),
             Exporter;
         _ ->
+            %% exporter is undefined/none
+            %% disable the insertion of new spans and delete the current table
+            clear_table_and_disable(RegName),
             undefined
     end.
 
+export_logs(CurrentTab, #data{exporter=Exporter,
+                              resource=Resource,
+                              table_1=Tab1,
+                              table_2=Tab2,
+                              reg_name=RegName,
+                              config=Config}) ->
+    NewCurrentTab = case CurrentTab of
+                        Tab1 -> Tab2;
+                        Tab2 -> Tab1
+                    end,
+
+    %% an atom is a single word so this does not trigger a global GC
+    persistent_term:put(?CURRENT_TABLES_KEY(RegName), NewCurrentTab),
+    %% set the table to accept inserts
+    enable(RegName),
+    From = self(),
+    RunnerPid = erlang:spawn_link(fun() -> send_logs(From, Resource, Exporter, Config) end),
+    ets:give_away(CurrentTab, RunnerPid, export),
+    RunnerPid.
+
+send_logs(FromPid, Resource, Exporter, Config) ->
+    receive
+        {'ETS-TRANSFER', Tab, FromPid, export} ->
+            export(Exporter, Resource, Tab, Config),
+            ets:delete(Tab),
+            completed(FromPid)
+    end.
+
+completed(FromPid) ->
+    FromPid ! {completed, self()}.
+
 export(undefined, _, _, _) ->
     true;
-export({ExporterModule, ExporterConfig}, Resource, Batch, Config) ->
+export({ExporterModule, ExporterConfig}, Resource, Tab, Config) ->
     %% don't let a exporter exception crash us
     %% and return true if exporter failed
     try
-        otel_exporter:export_logs(ExporterModule, {Batch, Config}, Resource, ExporterConfig)
+        otel_exporter:export_logs(ExporterModule, {Tab, Config}, Resource, ExporterConfig)
             =:= failed_not_retryable
     catch
         Kind:Reason:StackTrace ->
+            %% TODO: this log event and any other in this module must be somehow excluded
+            %% from being handled by otel_log_handler itself
             ?LOG_WARNING(#{source => exporter,
                            during => export,
                            kind => Kind,
@@ -251,3 +429,131 @@ report_cb(#{source := exporter,
             stacktrace := StackTrace}) ->
     {"log exporter threw exception: exporter=~p ~ts",
      [ExporterModule, otel_utils:format_exception(Kind, Reason, StackTrace)]}.
+
+
+enable(RegName)->
+    persistent_term:put(?IS_ENABLED(RegName), true).
+
+disable(RegName) ->
+    persistent_term:put(?IS_ENABLED(RegName), false).
+
+is_enabled(RegName) ->
+    persistent_term:get(?IS_ENABLED(RegName), true).
+
+new_export_table(Name) ->
+     ets:new(Name, [public,
+                    named_table,
+                    {write_concurrency, true},
+                    duplicate_bag]).
+
+do_insert(RegName, Scope, LogEvent) ->
+    try
+        case is_enabled(RegName) of
+            true ->
+                ets:insert(?CURRENT_TABLE(RegName), {Scope, LogEvent});
+            _ ->
+                dropped
+        end
+    catch
+        error:badarg ->
+            {error, no_otel_log_handler};
+        _:_ ->
+            {error, other}
+    end.
+
+clear_table_and_disable(RegName) ->
+    disable(RegName),
+    ets:delete(?CURRENT_TABLE(RegName)),
+    new_export_table(?CURRENT_TABLE(RegName)).
+
+complete_exporting(Data=#data{handed_off_table=ExportingTable})
+  when ExportingTable =/= undefined ->
+    new_export_table(ExportingTable),
+    {next_state, idle, Data#data{runner_pid=undefined,
+                                 handed_off_table=undefined}};
+complete_exporting(Data) ->
+    {next_state, idle, Data#data{runner_pid=undefined,
+                                 handed_off_table=undefined}}.
+
+kill_runner(Data=#data{runner_pid=RunnerPid}) when RunnerPid =/= undefined ->
+    Mon = erlang:monitor(process, RunnerPid),
+    erlang:unlink(RunnerPid),
+    erlang:exit(RunnerPid, kill),
+    %% Wait for the runner process terminatation to be sure that
+    %% the export table is destroyed and can be safely recreated
+    receive
+        {'DOWN', Mon, process, RunnerPid, _} ->
+            Data#data{runner_pid=undefined, handed_off_table=undefined}
+    end.
+
+maybe_wait_for_prev_runner(exporting, #data{runner_pid=RunnerPid}, RemTime) when is_pid(RunnerPid) ->
+    receive
+        {completed, RunnerPid} -> ok;
+        {'EXIT', RunnerPid, _} -> ok
+    after RemTime ->
+            ok
+    end;
+maybe_wait_for_prev_runner(_State, _Date, _RemTime) -> ok.
+
+default_config() ->
+    %% exporter is set separately because it's not allowed to be changed for now
+    #{max_queue_size => ?DEFAULT_MAX_QUEUE_SIZE,
+      max_export_batch_size => ?DEFAULT_MAX_EXPORT_BATCH_SIZE,
+      exporting_timeout_ms => ?DEFAULT_EXPORTER_TIMEOUT_MS,
+      scheduled_delay_ms => ?DEFAULT_SCHEDULED_DELAY_MS,
+      check_table_size_ms => ?DEFAULT_CHECK_TABLE_SIZE_MS}.
+
+validate_config(Config) ->
+    Errs = maps:fold(fun(K, Val, Acc) ->
+                             case validate_opt(K, Val, Config) of
+                                 ok -> Acc;
+                                 Err -> [Err | Acc]
+                             end
+              end,
+                     [], Config),
+    case Errs of
+        [] -> ok;
+        _ -> {error, Errs}
+    end.
+
+validate_opt(max_export_batch_size, Val, Config) ->
+    MaxQueueSize = maps:get(max_queue_size, Config, ?DEFAULT_MAX_QUEUE_SIZE),
+    IsValid = is_integer(Val) andalso Val > 0 andalso Val =< MaxQueueSize,
+    case IsValid of
+        true ->
+            ok;
+        false ->
+            {invalid_config,
+             "max_export_batch_size must be =< max_queue_size",
+             #{max_export_batch_size => Val, max_queue_size => MaxQueueSize}}
+    end;
+validate_opt(max_queue_size, infinity, _Config) ->
+    ok;
+validate_opt(K, Val, _Config) when is_integer(Val), Val > 0,
+                          K =:= max_queue_size;
+                          K =:= exporting_timeout_ms;
+                          K =:= scheduled_delay_ms;
+                          K =:= check_table_size_ms ->
+    ok;
+validate_opt(exporter, {Module, _}, _Config) when is_atom(Module) ->
+    ok;
+validate_opt(exporter, Module, _Config) when is_atom(Module) ->
+    ok;
+validate_opt(K, Val, _Config) ->
+    {invalid_config, K, Val}.
+
+add_config_to_data(#{config := OtelConfig} = Config, Data) ->
+    #{max_queue_size:=SizeLimit,
+      %% TODO: not implemented yet
+      max_export_batch_size:=MaxExportBatchSize,
+      exporting_timeout_ms:=ExportingTimeout,
+      scheduled_delay_ms:=ScheduledDelay,
+      check_table_size_ms:=CheckTableSize
+     } = OtelConfig,
+    Data#data{config=Config,
+              max_queue_size=SizeLimit,
+              %% TODO: not implemented yet
+              max_export_batch_size=MaxExportBatchSize,
+              exporting_timeout_ms=ExportingTimeout,
+              scheduled_delay_ms=ScheduledDelay,
+              check_table_size_ms=CheckTableSize}.
