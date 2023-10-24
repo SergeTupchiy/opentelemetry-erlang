@@ -51,15 +51,26 @@ to_proto(Tab, Resource, LogHandlerConfig) ->
     end.
 
 to_proto_by_instrumentation_scope(Tab, LogHandlerConfig) ->
-    Key = ets:first(Tab),
-    to_proto_by_instrumentation_scope(Tab, Key, LogHandlerConfig).
+    %% Even though during the export log eventss are being inserted to another table,
+    %% some late writes to the table being exported are still possible.
+    %% Thus, we can't lookup all the log events from the table and then let otel_log_handler
+    %% delete the table completely and re-create it as it will imply the risk of losing those (possible) late writes.
+    %% So, we fix the table and traverse it with ets:take/2. After that, the late writes won't be exported,
+    %% but they will be kept in the table and ready to be exported in the next exporter runs.
+    true = ets:safe_fixtable(Tab, true),
+    try
+        Key = ets:first(Tab),
+        to_proto_by_instrumentation_scope(Tab, Key, LogHandlerConfig)
+    after
+        _ = ets:safe_fixtable(Tab, false)
+    end.
 
 to_proto_by_instrumentation_scope(_Tab, '$end_of_table', _LogHandlerConfig) ->
     [];
 to_proto_by_instrumentation_scope(Tab, InstrumentationScope, LogHandlerConfig) ->
     InstrumentationScopeLogs = lists:foldl(fun({_Scope, LogEvent}, Acc) ->
                                                    [log_record(LogEvent, LogHandlerConfig) | Acc]
-                                           end, [], ets:lookup(Tab, InstrumentationScope)),
+                                           end, [], ets:take(Tab, InstrumentationScope)),
     InstrumentationScopeSpansProto = otel_otlp_common:to_instrumentation_scope_proto(InstrumentationScope),
     [InstrumentationScopeSpansProto#{log_records => InstrumentationScopeLogs}
     | to_proto_by_instrumentation_scope(Tab, ets:next(Tab, InstrumentationScope), LogHandlerConfig)].

@@ -1,5 +1,5 @@
 %%%------------------------------------------------------------------------
-%% Copyright 2022, OpenTelemetry Authors
+%% Copyright 2022-2023, OpenTelemetry Authors
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
 %% You may obtain a copy of the License at
@@ -12,8 +12,7 @@
 %% See the License for the specific language governing permissions and
 %% limitations under the License.
 %%
-%% @doc Specification:
-%% https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/logs/sdk.md
+%% @doc Specification: https://opentelemetry.io/docs/specs/otel/logs/sdk
 %% @end
 %%%-------------------------------------------------------------------------
 -module(otel_log_handler).
@@ -61,22 +60,6 @@
 -type scheduled_delay_ms() :: non_neg_integer().
 -type check_table_size_ms() :: non_neg_integer().
 
--record(data, {exporter              :: {module(), State :: term()} | undefined,
-               exporter_config       :: exporter_config(),
-               resource              :: otel_resource:t(),
-               handed_off_table      :: atom() | undefined,
-               runner_pid            :: pid() | undefined,
-               max_queue_size        :: max_queue_size(),
-               max_export_batch_size :: max_export_batch_size(),
-               exporting_timeout_ms  :: exporting_timeout_ms(),
-               scheduled_delay_ms    :: scheduled_delay_ms(),
-               check_table_size_ms   :: check_table_size_ms(),
-               table_1               :: atom(),
-               table_2               :: atom(),
-               reg_name              :: atom(),
-               config                :: config()
-              }).
-
 -define(SUP, opentelemetry_experimental_sup).
 
 -define(name_to_reg_name(Module, Id),
@@ -96,20 +79,35 @@
 -define(DEFAULT_EXPORTER,
         {opentelemetry_exporter, #{protocol => grpc, endpoints => ["http://172.18.0.2:4317"]}}).
 
--define(SUP_SHUTDOWN_MS, 5000).
-%% Sligthly lower than SUP_SHUTDOWN_MS
--define(GRACE_SHUTDOWN_MS, 4500).
+-define(SUP_SHUTDOWN_MS, 5500).
+%% Slightly lower than SUP_SHUTDOWN_MS
+-define(GRACE_SHUTDOWN_MS, 5000).
 -define(time_ms, erlang:monotonic_time(millisecond)).
 -define(rem_time(_Timeout_, _T0_, _T1_), max(0, _Timeout_ - (_T1_ - _T0_))).
 
 -define(check_tab_timeout(_TimeoutMs_), {{timeout, check_table_size}, _TimeoutMs_, check_table_size}).
 
+-record(data, {exporter              :: {module(), State :: term()} | undefined,
+               exporter_config       :: exporter_config(),
+               resource              :: otel_resource:t(),
+               handed_off_table      :: atom() | undefined,
+               runner_pid            :: pid() | undefined,
+               table_1               :: atom(),
+               table_2               :: atom(),
+               reg_name              :: atom(),
+               config                :: config(),
+               max_queue_size        = ?DEFAULT_MAX_QUEUE_SIZE        :: max_queue_size(),
+               max_export_batch_size = ?DEFAULT_MAX_EXPORT_BATCH_SIZE :: max_export_batch_size(),
+               exporting_timeout_ms  = ?DEFAULT_EXPORTER_TIMEOUT_MS   :: exporting_timeout_ms(),
+               scheduled_delay_ms    = ?DEFAULT_SCHEDULED_DELAY_MS    :: scheduled_delay_ms(),
+               check_table_size_ms   = ?DEFAULT_CHECK_TABLE_SIZE_MS   :: check_table_size_ms()
+              }).
+
 start_link(RegName, Config) ->
     gen_statem:start_link({local, RegName}, ?MODULE, [RegName, Config], []).
 
 %% TODO:
-%% - implment force flush
-%%   https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/logs/sdk.md#forceflush-1
+%% - implement force flush: https://opentelemetry.io/docs/specs/otel/logs/sdk/#forceflush
 %% - implement max_batch_size fully
 
 %%--------------------------------------------------------------------
@@ -196,14 +194,16 @@ init([RegName, #{config := OtelConfig} = Config]) ->
                  resource=Resource,
                  table_1=Tab1,
                  table_2=Tab2,
-                 reg_name=RegName},
+                 reg_name=RegName,
+                 config = Config},
     Data1 = add_config_to_data(Config, Data),
 
     %% TODO: it's enabled to start log events writes to ETS table,
     %% but soon the handler can fail to init exporter
     %% Disabling it if exporter config is none/undefined is not perfect either,
     %% since the exporter may default to localhost:<default port>.
-    %% It may be better to init exporter here in init/1 cb and make choice to enable/disable
+    %% It may be better to init exporter synchronously in `init/1` cb
+    %% and make choice to enable/disable
     _ = enable(RegName),
     {ok, idle, Data1, [?check_tab_timeout(Data1#data.check_table_size_ms)]}.
 
@@ -234,10 +234,10 @@ exporting({timeout, export_logs}, export_logs, _) ->
     {keep_state_and_data, [postpone]};
 exporting(enter, _OldState, #data{exporter=undefined,
                                   reg_name=RegName}) ->
-    %% exporter still undefined, go back to idle
-    %% first empty the table and disable the processor so no more log events are added
-    %% we wait until the attempt to export to disable so we don't lose log events
-    %% on startup but disable once it is clear an exporter isn't being set
+    %% exporter still undefined, go back to idle.
+    %% First empty the table and disable the processor so no more log events are added.
+    %% We wait until the attempt to export to disable so we don't lose log events
+    %% on startup but disable once it is clear the exporter isn't being set
     clear_table_and_disable(RegName),
 
     %% use state timeout to transition to `idle' since we can't set a
@@ -249,9 +249,14 @@ exporting(enter, _OldState, Data=#data{reg_name=RegName,
     CurrentTab = ?CURRENT_TABLE(RegName),
     case ets:info(CurrentTab, size) of
         0 ->
-            %% in an `enter' handler we can't return a `next_state' or `next_event'
-            %% so we rely on a timeout to trigger the transition to `idle'
-            {keep_state, Data#data{runner_pid=undefined}, [{state_timeout, 0, empty_table}]};
+            %% The other table may contain residual (late) writes not exported during
+            %% the previous run.
+            %% If current table is not empty,
+            %% we don't need to check the size of the previous (currently disabled) table,
+            %% since we will switch to it after this exporter run.
+            %% However, of current table remains empty for the long time, no export and table switch
+            %% will be triggered, and any residual late log events in the previous table will be left dangling.
+            maybe_export_other_table(CurrentTab, Data);
         _ ->
             RunnerPid = export_logs(CurrentTab, Data),
             {keep_state,
@@ -267,12 +272,9 @@ exporting(state_timeout, no_exporter, Data) ->
 exporting(state_timeout, empty_table, Data) ->
     {next_state, idle, Data};
 
-exporting(state_timeout, exporting_timeout, Data=#data{handed_off_table=ExportingTable}) ->
+exporting(state_timeout, exporting_timeout, Data) ->
     %% kill current exporting process because it is taking too long
-    %% which deletes the exporting table, so create a new one and
-    %% repeat the state to force another span exporting immediately
     Data1 = kill_runner(Data),
-    new_export_table(ExportingTable),
     {next_state, idle, Data1};
 %% important to verify runner_pid and FromPid are the same in case it was sent
 %% after kill_runner was called but before it had done the unlink
@@ -288,16 +290,29 @@ exporting(EventType, Event, Data) ->
 terminate(_Reason, State, Data=#data{exporter=Exporter,
                                      resource=Resource,
                                      reg_name=RegName,
-                                     config=Config}) ->
+                                     config=Config,
+                                     table_1=Tab1,
+                                     table_2=Tab2
+                                    }) ->
     _ = disable(RegName),
-    RunnerPid = erlang:spawn_link(fun() -> export(Exporter, Resource, ?CURRENT_TABLE(RegName), Config) end),
     T0 = ?time_ms,
-    receive
-        {'EXIT', RunnerPid, _} ->
-            T1 = ?time_ms,
-            maybe_wait_for_prev_runner(State, Data, ?rem_time(?GRACE_SHUTDOWN_MS, T0, T1))
-    after ?GRACE_SHUTDOWN_MS -> ok
-    end,
+    _ = maybe_wait_for_current_runner(State, Data, ?GRACE_SHUTDOWN_MS),
+    T1 = ?time_ms,
+
+    CurrentTab = ?CURRENT_TABLE(RegName),
+    OtherTab = next_table(CurrentTab, Tab1, Tab2),
+
+    %% Check both tables as each one may have some late unexported log events.
+    %% NOTE: exports are attempted sequentially to follow the specification restriction:
+    %% "Export will never be called concurrently for the same exporter instance"
+    %% (see: https://opentelemetry.io/docs/specs/otel/logs/sdk/#export).
+    RemTime = ?rem_time(?GRACE_SHUTDOWN_MS, T0, T1),
+    ets:info(CurrentTab, size) > 0 andalso export_and_wait(CurrentTab, Resource, Exporter, Config, RemTime),
+    T2 = ?time_ms,
+    RemTime1 = ?rem_time(RemTime, T1, T2),
+    ets:info(OtherTab, size) > 0 andalso export_and_wait(OtherTab, Resource, Exporter, Config, RemTime1),
+
+    _ = otel_exporter:shutdown(Exporter),
     ok.
 
 %%--------------------------------------------------------------------
@@ -314,8 +329,6 @@ start(Id, RegName, Config) ->
           modules  => [?MODULE]},
     case supervisor:start_child(?SUP, ChildSpec) of
         {ok, _Pid} ->
-            %% ok = logger_handler_watcher:register_handler(Name,Pid),
-            %% OlpOpts = logger_olp:get_opts(Olp),
             {ok, Config#{reg_name => RegName}};
         {error, {Reason, Ch}} when is_tuple(Ch), element(1, Ch) == child ->
             {error, Reason};
@@ -363,9 +376,31 @@ init_exporter(RegName, ExporterConfig) ->
             Exporter;
         _ ->
             %% exporter is undefined/none
-            %% disable the insertion of new spans and delete the current table
+            %% disable the insertion of new log events and delete the current table
             clear_table_and_disable(RegName),
             undefined
+    end.
+
+next_table(CurrentTab, Tab1, Tab2) when CurrentTab =:= Tab1 ->
+    Tab2;
+next_table(_CurrentTab, Tab1, _Tab2) -> Tab1.
+
+maybe_export_other_table(CurrentTab, Data=#data{table_1=Tab1,
+                                                table_2=Tab2,
+                                                exporting_timeout_ms=ExportingTimeout,
+                                                scheduled_delay_ms=SendInterval}) ->
+    NextTab = next_table(CurrentTab, Tab1, Tab2),
+    case ets:info(NextTab, size) of
+        0 ->
+            %% in an `enter' handler we can't return a `next_state' or `next_event'
+            %% so we rely on a timeout to trigger the transition to `idle'
+            {keep_state, Data#data{runner_pid=undefined}, [{state_timeout, 0, empty_table}]};
+        _ ->
+            RunnerPid = export_logs(NextTab, Data),
+            {keep_state,
+             Data#data{runner_pid=RunnerPid, handed_off_table=CurrentTab},
+             [{state_timeout, ExportingTimeout, exporting_timeout},
+              {{timeout, export_spans}, SendInterval, export_spans}]}
     end.
 
 export_logs(CurrentTab, #data{exporter=Exporter,
@@ -374,27 +409,21 @@ export_logs(CurrentTab, #data{exporter=Exporter,
                               table_2=Tab2,
                               reg_name=RegName,
                               config=Config}) ->
-    NewCurrentTab = case CurrentTab of
-                        Tab1 -> Tab2;
-                        Tab2 -> Tab1
-                    end,
+    NewCurrentTab = next_table(CurrentTab, Tab1, Tab2),
 
     %% an atom is a single word so this does not trigger a global GC
     persistent_term:put(?CURRENT_TABLES_KEY(RegName), NewCurrentTab),
     %% set the table to accept inserts
     enable(RegName),
-    From = self(),
-    RunnerPid = erlang:spawn_link(fun() -> send_logs(From, Resource, Exporter, Config) end),
-    ets:give_away(CurrentTab, RunnerPid, export),
-    RunnerPid.
+    export_async(CurrentTab, Resource, Exporter, Config).
 
-send_logs(FromPid, Resource, Exporter, Config) ->
-    receive
-        {'ETS-TRANSFER', Tab, FromPid, export} ->
-            export(Exporter, Resource, Tab, Config),
-            ets:delete(Tab),
-            completed(FromPid)
-    end.
+export_async(CurrentTab, Resource, Exporter, Config) ->
+    From = self(),
+    erlang:spawn_link(fun() -> send_logs(From, CurrentTab, Resource, Exporter, Config) end).
+
+send_logs(FromPid, Tab, Resource, Exporter, Config) ->
+    export(Exporter, Resource, Tab, Config),
+    completed(FromPid).
 
 completed(FromPid) ->
     FromPid ! {completed, self()}.
@@ -402,15 +431,16 @@ completed(FromPid) ->
 export(undefined, _, _, _) ->
     true;
 export({ExporterModule, ExporterConfig}, Resource, Tab, Config) ->
-    %% don't let a exporter exception crash us
-    %% and return true if exporter failed
+    %% TODO: better error handling, `
+    %% failed_not_retryable` is actually never returned from
     try
         otel_exporter:export_logs(ExporterModule, {Tab, Config}, Resource, ExporterConfig)
             =:= failed_not_retryable
     catch
         Kind:Reason:StackTrace ->
-            %% TODO: this log event and any other in this module must be somehow excluded
-            %% from being handled by otel_log_handler itself
+            %% Other logger handler(s) (e.g. default) should be enabled, so that
+            %% log events produced by otel_log_handler are not lost in case otel_log_handler
+            %% is not functioning properly.
             ?LOG_WARNING(#{source => exporter,
                            during => export,
                            kind => Kind,
@@ -429,7 +459,6 @@ report_cb(#{source := exporter,
             stacktrace := StackTrace}) ->
     {"log exporter threw exception: exporter=~p ~ts",
      [ExporterModule, otel_utils:format_exception(Kind, Reason, StackTrace)]}.
-
 
 enable(RegName)->
     persistent_term:put(?IS_ENABLED(RegName), true).
@@ -463,14 +492,10 @@ do_insert(RegName, Scope, LogEvent) ->
 
 clear_table_and_disable(RegName) ->
     disable(RegName),
-    ets:delete(?CURRENT_TABLE(RegName)),
-    new_export_table(?CURRENT_TABLE(RegName)).
+    CurrentTab = ?CURRENT_TABLE(RegName),
+    ets:delete(CurrentTab),
+    new_export_table(CurrentTab).
 
-complete_exporting(Data=#data{handed_off_table=ExportingTable})
-  when ExportingTable =/= undefined ->
-    new_export_table(ExportingTable),
-    {next_state, idle, Data#data{runner_pid=undefined,
-                                 handed_off_table=undefined}};
 complete_exporting(Data) ->
     {next_state, idle, Data#data{runner_pid=undefined,
                                  handed_off_table=undefined}}.
@@ -479,24 +504,35 @@ kill_runner(Data=#data{runner_pid=RunnerPid}) when RunnerPid =/= undefined ->
     Mon = erlang:monitor(process, RunnerPid),
     erlang:unlink(RunnerPid),
     erlang:exit(RunnerPid, kill),
-    %% Wait for the runner process terminatation to be sure that
-    %% the export table is destroyed and can be safely recreated
+    %% TODO: this is not required, as we don't delete/recreate tables
     receive
         {'DOWN', Mon, process, RunnerPid, _} ->
             Data#data{runner_pid=undefined, handed_off_table=undefined}
     end.
 
-maybe_wait_for_prev_runner(exporting, #data{runner_pid=RunnerPid}, RemTime) when is_pid(RunnerPid) ->
+%% terminate/3 helpers
+
+export_and_wait(Tab, Resource, Exporter, Config, Timeout) ->
+    RunnerPid = export_async(Tab, Resource, Exporter, Config),
+    wait_for_runner(RunnerPid, Timeout).
+
+wait_for_runner(RunnerPid, Timeout) ->
     receive
         {completed, RunnerPid} -> ok;
         {'EXIT', RunnerPid, _} -> ok
-    after RemTime ->
+    after Timeout ->
+            erlang:exit(RunnerPid, kill),
             ok
-    end;
-maybe_wait_for_prev_runner(_State, _Date, _RemTime) -> ok.
+    end.
+
+maybe_wait_for_current_runner(exporting, #data{runner_pid=RunnerPid}, Timeout) when is_pid(RunnerPid) ->
+    wait_for_runner(RunnerPid, Timeout);
+maybe_wait_for_current_runner(_State, _Date, _Timeout) -> ok.
+
+%% Config helpers
 
 default_config() ->
-    %% exporter is set separately because it's not allowed to be changed for now
+    %% exporter is set separately because it's not allowed to be changed for now (requires handler restart)
     #{max_queue_size => ?DEFAULT_MAX_QUEUE_SIZE,
       max_export_batch_size => ?DEFAULT_MAX_EXPORT_BATCH_SIZE,
       exporting_timeout_ms => ?DEFAULT_EXPORTER_TIMEOUT_MS,
@@ -544,7 +580,6 @@ validate_opt(K, Val, _Config) ->
 
 add_config_to_data(#{config := OtelConfig} = Config, Data) ->
     #{max_queue_size:=SizeLimit,
-      %% TODO: not implemented yet
       max_export_batch_size:=MaxExportBatchSize,
       exporting_timeout_ms:=ExportingTimeout,
       scheduled_delay_ms:=ScheduledDelay,
@@ -552,7 +587,6 @@ add_config_to_data(#{config := OtelConfig} = Config, Data) ->
      } = OtelConfig,
     Data#data{config=Config,
               max_queue_size=SizeLimit,
-              %% TODO: not implemented yet
               max_export_batch_size=MaxExportBatchSize,
               exporting_timeout_ms=ExportingTimeout,
               scheduled_delay_ms=ScheduledDelay,
