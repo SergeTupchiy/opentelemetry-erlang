@@ -66,8 +66,7 @@ to_proto_by_instrumentation_scope(Tab, InstrumentationScope, LogHandlerConfig) -
 
 log_record(#{level := Level,
              msg := Body,
-             meta := Metadata=#{time := ObservedTime}}, Config) ->
-    Time = opentelemetry:timestamp(),
+             meta := Metadata=#{time := Time}}, Config) ->
     {SeverityNumber, SeverityText} = level_to_severity(Level),
     Body1 = case format_msg(Body, Metadata, Config) of
                 S when ?IS_STRING(S) ->
@@ -98,8 +97,14 @@ log_record(#{level := Level,
                         #{}
                 end,
 
-    LogRecord#{time_unix_nano          => Time,
-               observed_time_unix_nano => ObservedTime,
+    %% Time produced by logger, the unit is microsecond:
+    %% https://www.erlang.org/doc/man/logger#timestamp-0
+    TimeNano = erlang:convert_time_unit(Time, microsecond, nanosecond),
+
+    LogRecord#{time_unix_nano          => TimeNano,
+               %% Setting the same logger time to both fields, acc. to the specification:
+               %% https://opentelemetry.io/docs/specs/otel/logs/data-model/#field-observedtimestamp
+               observed_time_unix_nano => TimeNano,
                severity_number         => SeverityNumber,
                severity_text           => SeverityText,
                body                    => otel_otlp_common:to_any_value(Body1),
