@@ -348,7 +348,7 @@ handle_event_(State, {timeout, check_table_size}, check_table_size,
     end,
     case Size >= MaxBatchSize of
         true when State =:= exporting ->
-            {keep_state_and_data, [postpone]};
+            {keep_state_and_data, [?check_tab_timeout(CheckInterval)]};
         true ->
             %% By no means it can ensure that max_export_batch_size is never exceeded.
             %% However, it should work fine to trigger export as soon as the table
