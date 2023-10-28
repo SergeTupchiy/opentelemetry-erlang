@@ -6,7 +6,7 @@
 -include_lib("stdlib/include/assert.hrl").
 -include_lib("common_test/include/ct.hrl").
 
--define(OTEL_LOG_HANDLER, otel_log_handler).
+-define(OTEL_LOG_HANDLER, otel_log_handler1).
 -define(LOG_MSG, "otel_log_hanlder_SUITE test, please ignore it").
 -define(TRACEPARENT, "00-0226551413cd73a554184b324c82ad51-b7ad6b71432023a2-01").
 
@@ -168,8 +168,7 @@ exporting_runner_timeout_test(Config) ->
 
 check_table_size_max_queue_test(Config) ->
     HandlerId = ?config(handler_id, Config),
-    {ok, #{reg_name := RegName,
-           config := #{max_queue_size := MaxQueueSize,
+    {ok, #{config := #{max_queue_size := MaxQueueSize,
                        check_table_size_ms := CheckTableSizeMs}
           } = HandlerConf} = logger:get_handler_config(HandlerId),
 
@@ -183,7 +182,7 @@ check_table_size_max_queue_test(Config) ->
     %% Wait for more than CheckTableSizeMs to be sure check timeout occurred
     timer:sleep(CheckTableSizeMs * 5),
 
-    dropped = ?OTEL_LOG_HANDLER:log(log_event(), #{reg_name => RegName}).
+    dropped = ?OTEL_LOG_HANDLER:log(log_event(), HandlerConf).
 
 export_max_batch_success_test(Config) ->
     HandlerId = ?config(handler_id, Config),
@@ -304,11 +303,13 @@ shutdown(_) ->
 %% helpers
 
 common_testcase_init(Config) ->
+    {ok, _} = application:ensure_all_started(opentelemetry_exporter),
     {ok, _} = application:ensure_all_started(opentelemetry_experimental),
     Config.
 
 common_testcase_cleanup(_Config) ->
     _ = application:stop(opentelemetry_experimental),
+    _ = application:stop(opentelemetry_exporter),
     ok.
 
 log_event() ->
